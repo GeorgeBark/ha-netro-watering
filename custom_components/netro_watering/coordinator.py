@@ -12,6 +12,8 @@ from dateutil.relativedelta import relativedelta
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from netrohomeapi import NetroHomeAPI
 
 from .const import (
     DOMAIN,
@@ -61,15 +63,6 @@ from .const import (
     NETRO_ZONE_SMART,
     TZ_OFFSET,
 )
-from .netrofunction import (
-    get_info as netro_get_info,
-    get_moistures as netro_get_moistures,
-    get_schedules as netro_get_schedules,
-    get_sensor_data as netro_get_sensor_data,
-    set_status as netro_set_status,
-    stop_water as netro_stop_water,
-    water as netro_water,
-)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -97,7 +90,7 @@ def prepare_slowdown_factors(slowdown_factor: list) -> list | None:
     return slowdown_factor
 
 
-def get_slowdown_factor(slowdown_factors, this_time: datetime.time) -> int:
+def get_slowdown_factor(slowdown_factors, this_time: datetime.datetime) -> int:
     """Return the update interval obtained by multiplying the refresh interval by a slowdown factor possibly applicable to this time."""
 
     # this is the default value
@@ -158,6 +151,7 @@ class NetroSensorUpdateCoordinator(DataUpdateCoordinator):
     local_date = None
     local_time = None
     _metadata = None
+    _api: NetroHomeAPI
 
     def __init__(
         self,
@@ -183,6 +177,7 @@ class NetroSensorUpdateCoordinator(DataUpdateCoordinator):
         self.hw_version = hw_version
         self.sw_version = sw_version
         self.sensor_value_days_before_today = sensor_value_days_before_today
+        self._api = NetroHomeAPI(api_key=serial_number, session=async_get_clientsession(hass))
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -217,12 +212,19 @@ class NetroSensorUpdateCoordinator(DataUpdateCoordinator):
         _LOGGER.info(
             "Polling info for %s sensor (repeated every %d minutes)",
             self.name,
-            self.update_interval.total_seconds() / 60,
+            self.update_interval.total_seconds() / 60 if self.update_interval else 0,
         )
 
-        res = await self.hass.async_add_executor_job(
-            netro_get_sensor_data,
-            self.serial_number,
+        # res = await self.hass.async_add_executor_job(
+        #     netro_get_sensor_data,
+        #     self.serial_number,
+        #     (
+        #         datetime.date.today()
+        #         - timedelta(days=self.sensor_value_days_before_today)
+        #     ).strftime("%Y-%m-%d"),
+        #     datetime.date.today().strftime("%Y-%m-%d"),
+        # )
+        res = await self._api.get_sensor_data_raw (
             (
                 datetime.date.today()
                 - timedelta(days=self.sensor_value_days_before_today)
@@ -302,22 +304,29 @@ class NetroControllerUpdateCoordinator(DataUpdateCoordinator):
             self, duration: int, delay: int, start_time: datetime.time
         ) -> None:
             """Start watering for the current zone for given duration in minutes."""
-            await self.parent_controller.hass.async_add_executor_job(
-                netro_water,
-                self.parent_controller.serial_number,
+            # await self.parent_controller.hass.async_add_executor_job(
+            #     netro_water,
+            #     self.parent_controller.serial_number,
+            #     duration,
+            #     [str(self.ith)],
+            #     delay,
+            #     start_time.strftime("%Y-%m-%d %H:%M")
+            #     if start_time is not None
+            #     else None,
+            # )
+            await self.parent_controller._api.water_raw(
                 duration,
-                [str(self.ith)],
+                [self.ith],
                 delay,
-                start_time.strftime("%Y-%m-%d %H:%M")
-                if start_time is not None
-                else None,
+                start_time.strftime("%Y-%m-%d %H:%M") if start_time is not None else None,
             )
 
         async def stop_watering(self) -> None:
             """Stop watering (all zone included as unexpected - improvement expected)."""
-            await self.parent_controller.hass.async_add_executor_job(
-                netro_stop_water, self.parent_controller.serial_number
-            )
+            # await self.parent_controller.hass.async_add_executor_job(
+            #     netro_stop_water, self.parent_controller.serial_number
+            # )
+            await self.parent_controller._api.stop_water_raw()
 
         @property
         def watering(self) -> bool | None:
@@ -437,7 +446,7 @@ class NetroControllerUpdateCoordinator(DataUpdateCoordinator):
     # _active_zones is a dictionary indexed by the zone ith and whose value is a Zone object
     _schedules = []
     _moistures = []
-
+    _api: NetroHomeAPI
     def __init__(
         self,
         hass: HomeAssistant,
@@ -471,6 +480,7 @@ class NetroControllerUpdateCoordinator(DataUpdateCoordinator):
         self.schedules_months_before = schedules_months_before
         self.schedules_months_after = schedules_months_after
         self._active_zones = {}
+        self._api = NetroHomeAPI(api_key=serial_number, session=async_get_clientsession(hass))
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -675,10 +685,7 @@ class NetroControllerUpdateCoordinator(DataUpdateCoordinator):
         )
 
         # get main data
-        res = await self.hass.async_add_executor_job(
-            netro_get_info,
-            self.serial_number,
-        )
+        res = await self._api.get_info_raw()
 
         device_data = res["data"]["device"]
         meta_data = res["meta"]
@@ -695,7 +702,7 @@ class NetroControllerUpdateCoordinator(DataUpdateCoordinator):
             meta_data[NETRO_METADATA_TOKEN_REMAINING],
             meta_data[NETRO_METADATA_TOKEN_RESET],
         )
-        if device_data.get(NETRO_CONTROLLER_BATTERY_LEVEL):
+        if NETRO_CONTROLLER_BATTERY_LEVEL in device_data:
             self.battery_level = device_data[NETRO_CONTROLLER_BATTERY_LEVEL] * 100
 
         # load the actives zones
@@ -709,24 +716,35 @@ class NetroControllerUpdateCoordinator(DataUpdateCoordinator):
                     zone[NETRO_ZONE_SMART],
                     zone[NETRO_ZONE_NAME]
                     if zone[NETRO_ZONE_NAME] is not None
-                    else self.device_name + "-" + zone[NETRO_ZONE_ITH],
+                    else self.device_name + "-" + str(zone[NETRO_ZONE_ITH]),
                     self.serial_number,
                 )
 
         # get moistures
-        res = await self.hass.async_add_executor_job(
-            netro_get_moistures,
-            self.serial_number,
-        )
+        # res = await self.hass.async_add_executor_job(
+        #     netro_get_moistures,
+        #     self.serial_number,
+        # )
+        res = await self._api.get_moistures_raw()
 
         # update controller and zone attributes from moistures
         self._update_from_moistures(res["data"]["moistures"])
 
         # get schedules
-        res = await self.hass.async_add_executor_job(
-            netro_get_schedules,
-            self.serial_number,
-            None,
+        # res = await self.hass.async_add_executor_job(
+        #     netro_get_schedules,
+        #     self.serial_number,
+        #     None,
+        #     str(
+        #         datetime.date.today()
+        #         - relativedelta(months=self.schedules_months_before)
+        #     ),
+        #     str(
+        #         datetime.date.today()
+        #         + relativedelta(months=self.schedules_months_after)
+        #     ),
+        # )
+        res = await self._api.get_schedules_raw(
             str(
                 datetime.date.today()
                 - relativedelta(months=self.schedules_months_before)
@@ -742,18 +760,24 @@ class NetroControllerUpdateCoordinator(DataUpdateCoordinator):
 
     async def enable(self):
         """Enable controller."""
-        res = await self.hass.async_add_executor_job(
-            netro_set_status,
-            self.serial_number,
+        # res = await self.hass.async_add_executor_job(
+        #     netro_set_status,
+        #     self.serial_number,
+        #     NETRO_STATUS_ENABLE,
+        # )
+        res = await self._api.set_device_status_raw(
             NETRO_STATUS_ENABLE,
         )
         return res
 
     async def disable(self):
         """Disable controller."""
-        res = await self.hass.async_add_executor_job(
-            netro_set_status,
-            self.serial_number,
+        # res = await self.hass.async_add_executor_job(
+        #     netro_set_status,
+        #     self.serial_number,
+        #     NETRO_STATUS_DISABLE,
+        # )
+        res = await self._api.set_device_status_raw(
             NETRO_STATUS_DISABLE,
         )
         return res
@@ -762,9 +786,15 @@ class NetroControllerUpdateCoordinator(DataUpdateCoordinator):
         self, duration: int, delay: int, start_time: datetime.time
     ) -> None:
         """Start watering for the current zone for given duration in minutes."""
-        await self.hass.async_add_executor_job(
-            netro_water,
-            self.serial_number,
+        # await self.hass.async_add_executor_job(
+        #     netro_water,
+        #     self.serial_number,
+        #     duration,
+        #     None,
+        #     delay,
+        #     start_time.strftime("%Y-%m-%d %H:%M") if start_time is not None else None,
+        # )
+        await self._api.water_raw(
             duration,
             None,
             delay,
@@ -773,7 +803,7 @@ class NetroControllerUpdateCoordinator(DataUpdateCoordinator):
 
     async def stop_watering(self) -> None:
         """Stop watering (all zone included as expected)."""
-        await self.hass.async_add_executor_job(netro_stop_water, self.serial_number)
+        await self._api.stop_water_raw()
 
     def __str__(self) -> str:
         """Convert to string, for logging in particular."""
